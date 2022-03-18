@@ -85,11 +85,19 @@ namespace SIPSorcery.Net
         public event Action onclose;
         public event OnDataChannelMessageDelegate onmessage;
 
-        public RTCDataChannel(RTCSctpTransport transport, RTCDataChannelInit init = null)
+        public RTCDataChannel(RTCSctpTransport transport, RTCDataChannelInit init)
         {
             _transport = transport;
 
-            // TODO: Apply init settings.
+            id = init.id;
+            maxRetransmits = init.maxRetransmits;
+            maxPacketLifeTime = init.maxPacketLifeTime;
+            ordered = init.ordered;
+            negotiated = init.negotiated;
+            protocol = init.protocol;
+
+            // TODO: maxRetransmits and maxPacketLifeTime can not be used together
+            // And should throw an error somewhere https://www.w3.org/TR/webrtc/#rtcdatachannel
         }
 
         internal void GotAck()
@@ -196,7 +204,9 @@ namespace SIPSorcery.Net
             var dcepOpen = new DataChannelOpenMessage()
             {
                 MessageType = (byte)DataChannelMessageTypes.OPEN,
-                ChannelType = (byte)DataChannelTypes.DATA_CHANNEL_RELIABLE_UNORDERED,
+                ChannelType = (byte)GetChannelType(),
+                Reliability = GetReliability(),
+                Protocol = protocol,
                 Label = label
             };
 
@@ -219,6 +229,50 @@ namespace SIPSorcery.Net
                 _transport.RTCSctpAssociation.SendData(id.GetValueOrDefault(),
                        (uint)DataChannelPayloadProtocols.WebRTC_DCEP,
                        new byte[] { (byte)DataChannelMessageTypes.ACK });
+            }
+        }
+
+        /// <summary>
+        /// Gets the data channel type based on the data channel initialization parameters. 
+        /// See https://datatracker.ietf.org/doc/html/rfc8832#section-5.1
+        /// </summary>
+        /// <returns>The data channel type</returns>
+        private DataChannelTypes GetChannelType()
+        {           
+            if (maxRetransmits != null)
+            {
+                return ordered ? DataChannelTypes.DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT : DataChannelTypes.DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED;
+            }
+            else if (maxPacketLifeTime != null)
+            {
+                return ordered ? DataChannelTypes.DATA_CHANNEL_PARTIAL_RELIABLE_TIMED : DataChannelTypes.DATA_CHANNEL_PARTIAL_RELIABLE_TIMED_UNORDERED;
+            }
+            else
+            {
+                return ordered ? DataChannelTypes.DATA_CHANNEL_RELIABLE : DataChannelTypes.DATA_CHANNEL_RELIABLE_UNORDERED;
+            }
+        }
+
+        /// <summary>
+        /// Gets the data channel reliability based on the data channel type.
+        /// See https://datatracker.ietf.org/doc/html/rfc8832#section-5.1
+        /// </summary>
+        /// <returns>The data channel reliability</returns>
+        private uint GetReliability()
+        {
+            switch (GetChannelType())
+            {
+                case DataChannelTypes.DATA_CHANNEL_RELIABLE:
+                case DataChannelTypes.DATA_CHANNEL_RELIABLE_UNORDERED:
+                    return default;
+                case DataChannelTypes.DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT:
+                case DataChannelTypes.DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED:
+                    return maxRetransmits.Value;
+                case DataChannelTypes.DATA_CHANNEL_PARTIAL_RELIABLE_TIMED:
+                case DataChannelTypes.DATA_CHANNEL_PARTIAL_RELIABLE_TIMED_UNORDERED:
+                    return maxPacketLifeTime.Value;
+                default:
+                    return default;
             }
         }
 
