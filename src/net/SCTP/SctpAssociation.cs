@@ -802,5 +802,18 @@ namespace SIPSorcery.Net
                 _cookieEchoRetransmits++;
             }
         }
+
+        /// <summary>
+        /// Configures the sender and receiver to use the given parameters for packet retransmission and lifetime  
+        /// for the specified stream id
+        /// </summary>
+        /// <param name="streamId">The id of the stream to configure</param>
+        /// <param name="ordered">Whether the chunks are required to arrive in order. Default is true.</param>
+        /// <param name="maxRetransmits">The maximum number of retransmissions. If null, there is no limit.</param>
+        /// <param name="maxPacketLifetime">The maximum lifetime for a packet. If null, there is no limit.</param>
+        internal void ConfigureStreamReliability(ushort streamId, bool ordered, ushort? maxRetransmits, ushort? maxPacketLifetime)
+        {
+            _dataSender.ConfigureStreamReliability(streamId, ordered, maxRetransmits, maxPacketLifetime);
+        }
     }
 }

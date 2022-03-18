@@ -39,8 +39,15 @@ namespace SIPSorcery.Net
         {
             if (channel.id.HasValue)
             {
-                if (!activeChannels.TryAdd(channel.id.Value, channel))
+                if (activeChannels.TryAdd(channel.id.Value, channel))
+                {
+                    channel.ConfigureTransport();
+                }
+                else
+                {
                     return false;
+                }
+                
             }
             else
             {
@@ -50,6 +57,7 @@ namespace SIPSorcery.Net
                     if (activeChannels.TryAdd(id, channel))
                     {
                         channel.id = id;
+                        channel.ConfigureTransport();
                         break;
                     }
                 }

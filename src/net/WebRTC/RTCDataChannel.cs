@@ -233,6 +233,18 @@ namespace SIPSorcery.Net
         }
 
         /// <summary>
+        /// Configures the underlying RTCSctpAssociation to have an appropriate reliability configuration.  
+        /// Must be called after the Id has been assigned (or acknowledged) by the peer connection.
+        /// </summary>
+        internal void ConfigureTransport()
+        {
+            lock (this)
+            {
+                _transport.RTCSctpAssociation.ConfigureStreamReliability(id.GetValueOrDefault(), ordered, maxRetransmits, maxPacketLifeTime);
+            }
+        }
+
+        /// <summary>
         /// Gets the data channel type based on the data channel initialization parameters. 
         /// See https://datatracker.ietf.org/doc/html/rfc8832#section-5.1
         /// </summary>
@@ -267,10 +279,10 @@ namespace SIPSorcery.Net
                     return default;
                 case DataChannelTypes.DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT:
                 case DataChannelTypes.DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED:
-                    return maxRetransmits.Value;
+                    return maxRetransmits.GetValueOrDefault();
                 case DataChannelTypes.DATA_CHANNEL_PARTIAL_RELIABLE_TIMED:
                 case DataChannelTypes.DATA_CHANNEL_PARTIAL_RELIABLE_TIMED_UNORDERED:
-                    return maxPacketLifeTime.Value;
+                    return maxPacketLifeTime.GetValueOrDefault();
                 default:
                     return default;
             }

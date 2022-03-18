@@ -83,7 +83,20 @@ namespace SIPSorcery.Net
         /// </summary>
         public byte[] UserData;
 
+        /// <summary>
+        /// The maximum <see cref="SendCount"/> before this chunk is abandoned. 
+        /// If non-null, the stream for this chunk is unreliable.
+        /// </summary>
+        internal ushort? MaxRetransmits;
+
+        /// <summary>
+        /// The maximum time in milliseconds since <see cref="CreatedAt"/> before this chunk is abandoned. 
+        /// If non-null, the stream for this chunk is unreliable.
+        /// </summary>
+        internal ushort? MaxPacketLifetime;
+
         // These properties are used by the data sender.
+        internal DateTime CreatedAt;
         internal DateTime LastSentAt;
         internal int SendCount;
 
@@ -133,6 +146,8 @@ namespace SIPSorcery.Net
                 (Unordered ? 0x04 : 0x0) +
                 (Begining ? 0x02 : 0x0) +
                 (Ending ? 0x01 : 0x0));
+
+            CreatedAt = DateTime.Now;
         }
 
         /// <summary>

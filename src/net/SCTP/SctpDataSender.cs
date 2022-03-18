@@ -28,6 +28,22 @@ using SIPSorcery.Sys;
 
 namespace SIPSorcery.Net
 {
+    internal class SctpStreamConfiguration
+    {
+        /// <summary>
+        /// Indicates that the stream is ordered.
+        /// </summary>
+        public bool Ordered = true;
+        /// <summary>
+        /// If non-null, limits the maximum number of retransmissions that can be attempted.
+        /// </summary>
+        public ushort? MaxRetransmits;
+        /// <summary>
+        /// If non-null, limits the lifetime of a chunk (in milliseconds)
+        /// </summary>
+        public ushort? MaxPacketLifetime;
+    }
+
     public class SctpDataSender
     {
         public const ushort DEFAULT_SCTP_MTU = 1300;
@@ -143,6 +159,11 @@ namespace SIPSorcery.Net
         /// and that need to be re-sent.
         /// </summary>
         internal ConcurrentDictionary<uint, int> _missingChunks = new ConcurrentDictionary<uint, int>();
+
+        /// <summary>
+        /// Maps a stream ID to the configuration to be used when processing chunks on the stream. 
+        /// </summary>
+        private Dictionary<ushort, SctpStreamConfiguration> _streamConfigurations = new Dictionary<ushort, SctpStreamConfiguration>();
 
         /// <summary>
         /// The total size (in bytes) of queued user data that will be sent to the peer.
@@ -291,15 +312,21 @@ namespace SIPSorcery.Net
                     bool isBegining = index == 0;
                     bool isEnd = ((offset + payloadLength) >= data.Length) ? true : false;
 
+                    _streamConfigurations.TryGetValue(streamID, out SctpStreamConfiguration config);
+                    bool ordered = config?.Ordered ?? true;
                     SctpDataChunk dataChunk = new SctpDataChunk(
-                        false,
+                        !ordered,
                         isBegining,
                         isEnd,
                         TSN,
                         streamID,
                         seqnum,
                         ppid,
-                        payload);
+                        payload)
+                    {
+                        MaxRetransmits = config?.MaxRetransmits,
+                        MaxPacketLifetime = config?.MaxPacketLifetime
+                    };
 
                     _sendQueue.Enqueue(dataChunk);
 
@@ -458,14 +485,23 @@ namespace SIPSorcery.Net
                     {
                         if (_unconfirmedChunks.TryGetValue(misses.Current.Key, out var missingChunk))
                         {
-                            missingChunk.LastSentAt = now;
-                            missingChunk.SendCount += 1;
+                            if (IsChunkExpired(missingChunk, now))
+                            {
+                                logger.LogTrace($"SCTP discarded missing chunk.");
+                                _unconfirmedChunks.TryRemove(misses.Current.Key, out _);
+                                _missingChunks.TryRemove(misses.Current.Key, out _);
+                            }
+                            else
+                            {
+                                missingChunk.LastSentAt = now;
+                                missingChunk.SendCount += 1;
 
-                            logger.LogTrace($"SCTP resending missing data chunk for TSN {missingChunk.TSN}, data length {missingChunk.UserData.Length}, " +
-                                $"flags {missingChunk.ChunkFlags:X2}, send count {missingChunk.SendCount}.");
+                                logger.LogTrace($"SCTP resending missing data chunk for TSN {missingChunk.TSN}, data length {missingChunk.UserData.Length}, " +
+                                    $"flags {missingChunk.ChunkFlags:X2}, send count {missingChunk.SendCount}.");
 
-                            _sendDataChunk(missingChunk);
-                            chunksSent++;
+                                _sendDataChunk(missingChunk);
+                                chunksSent++;
+                            }
                         }
 
                         haveMissing = misses.MoveNext();
@@ -475,27 +511,36 @@ namespace SIPSorcery.Net
                 // Check if there are any unconfirmed transactions that are due for a retransmit.
                 if (chunksSent < burstSize && _unconfirmedChunks.Count > 0)
                 {
-                    foreach (var chunk in _unconfirmedChunks.Values
-                        .Where(x => now.Subtract(x.LastSentAt).TotalSeconds > RTO_MIN_SECONDS)
+                    foreach (var kvp in _unconfirmedChunks
+                        .Where(x => now.Subtract(x.Value.LastSentAt).TotalSeconds > RTO_MIN_SECONDS)
                         .Take(burstSize - chunksSent))
                     {
-                        chunk.LastSentAt = DateTime.Now;
-                        chunk.SendCount += 1;
-
-                        logger.LogTrace($"SCTP retransmitting data chunk for TSN {chunk.TSN}, data length {chunk.UserData.Length}, " +
-                            $"flags {chunk.ChunkFlags:X2}, send count {chunk.SendCount}.");
-
-                        _sendDataChunk(chunk);
-                        chunksSent++;
-                        
-                        if (!_inRetransmitMode)
+                        var chunk = kvp.Value;
+                        if (IsChunkExpired(chunk, now))
                         {
-                            _inRetransmitMode = true;
+                            logger.LogTrace($"SCTP unconfirmed chunk discarded.");
+                            _unconfirmedChunks.TryRemove(kvp.Key, out _);
+                        }
+                        else
+                        {
+                            chunk.LastSentAt = DateTime.Now;
+                            chunk.SendCount += 1;
 
-                            // When the T3-rtx timer expires on an address, SCTP should perform slow start.
-                            // RFC4960 7.2.3
-                            _slowStartThreshold = (uint)Math.Max(_congestionWindow / 2, 4 * _defaultMTU);
-                            _congestionWindow = _defaultMTU;
+                            logger.LogTrace($"SCTP retransmitting data chunk for TSN {chunk.TSN}, data length {chunk.UserData.Length}, " +
+                                $"flags {chunk.ChunkFlags:X2}, send count {chunk.SendCount}.");
+
+                            _sendDataChunk(chunk);
+                            chunksSent++;
+
+                            if (!_inRetransmitMode)
+                            {
+                                _inRetransmitMode = true;
+
+                                // When the T3-rtx timer expires on an address, SCTP should perform slow start.
+                                // RFC4960 7.2.3
+                                _slowStartThreshold = (uint)Math.Max(_congestionWindow / 2, 4 * _defaultMTU);
+                                _congestionWindow = _defaultMTU;
+                            }
                         }
                     }
                 }
@@ -505,6 +550,12 @@ namespace SIPSorcery.Net
                 {
                     while (chunksSent < burstSize && _sendQueue.TryDequeue(out var dataChunk))
                     {
+                        if (IsChunkExpired(dataChunk, now))
+                        {
+                            logger.LogTrace($"SCTP chunk discarded without sending.");
+                            continue;
+                        }
+
                         dataChunk.LastSentAt = DateTime.Now;
                         dataChunk.SendCount = 1;
 
@@ -528,6 +579,21 @@ namespace SIPSorcery.Net
             }
 
             logger.LogDebug($"SCTP association data send thread stopped for association {_associationID}.");
+        }
+
+        private bool IsChunkExpired(SctpDataChunk chunk, DateTime now)
+        {
+            if (chunk.MaxRetransmits.HasValue && chunk.MaxRetransmits.Value < chunk.SendCount)
+            {
+                logger.LogTrace($"SCP chunk has expired due to exceeding the retransmission count.");
+                return true;
+            }
+            else if (chunk.MaxPacketLifetime.HasValue && (now - chunk.CreatedAt).TotalMilliseconds > chunk.MaxPacketLifetime.Value)
+            {
+                logger.LogTrace($"SCTP chunk has expired due to exceeding the maximum packet lifetime.");
+                return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -616,6 +682,24 @@ namespace SIPSorcery.Net
                     return _congestionWindow;
                 }
             }
+        }
+
+        /// <summary>
+        /// Configures the receiver to use the given parameters for packet retransmission and lifetime  
+        /// for the specified stream id
+        /// </summary>
+        /// <param name="streamId">The id of the stream to configure</param>
+        /// <param name="ordered">Whether the chunks are required to arrive in order. Default is true.</param>
+        /// <param name="maxRetransmits">The maximum number of retransmissions. If null, there is no limit.</param>
+        /// <param name="maxPacketLifetime">The maximum lifetime for a packet. If null, there is no limit.</param>
+        internal void ConfigureStreamReliability(ushort streamId, bool ordered, ushort? maxRetransmits, ushort? maxPacketLifetime)
+        {
+            _streamConfigurations[streamId] = new SctpStreamConfiguration()
+            {
+                Ordered = ordered,
+                MaxRetransmits = maxRetransmits,
+                MaxPacketLifetime = maxPacketLifetime
+            };
         }
     }
 }
