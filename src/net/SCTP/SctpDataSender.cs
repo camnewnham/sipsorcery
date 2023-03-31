@@ -77,6 +77,8 @@ namespace SIPSorcery.Net
         private bool _isClosed;
         private int _lastAckedDataChunkSize;
         private bool _inRetransmitMode;
+        private bool _inFastRecoveryMode;
+        private uint _fastRecoveryExitPoint;
         private ManualResetEventSlim _senderMre = new ManualResetEventSlim();
 
         /// <summary>
@@ -274,6 +276,17 @@ namespace SIPSorcery.Net
                     {
                         ProcessGapReports(sack.GapAckBlocks, maxTSNDistance);
                     }
+
+                    // rfc4960 6.2.1 D iv
+                    // If the Cumulative TSN Ack matches or exceeds the Fast Recovery exitpoint(Section 7.2.4), Fast Recovery is exited.
+                    if (_inFastRecoveryMode)
+                    {
+                        if (SctpDataReceiver.IsNewerOrEqual(_fastRecoveryExitPoint, _cumulativeAckTSN))
+                        {
+                            logger.LogTrace($"SCTP sender exiting fast recovery at TSN {_fastRecoveryExitPoint}");
+                            _inFastRecoveryMode = false;
+                        }
+                    }
                 }
 
                 _receiverWindow = CalculateReceiverWindow(sack.ARwnd);
@@ -375,6 +388,11 @@ namespace SIPSorcery.Net
         {
             uint lastAckTSN = _cumulativeAckTSN;
 
+            // https://www.rfc-editor.org/rfc/rfc4960#section-7.2.4
+            // Find the highest outstanding TSN, to be used when (if) entering fast recovery
+
+            // For each incoming SACK, miss indications are incremented only for missing TSNs prior to the highest TSN newly acknowledged in the SACK.
+         
             foreach (var gapBlock in sackGapBlocks)
             {
                 uint goodTSNStart = _cumulativeAckTSN + gapBlock.Start;
@@ -398,7 +416,7 @@ namespace SIPSorcery.Net
 
                     while (missingTSN != goodTSNStart)
                     {
-                        if (!_missingChunks.ContainsKey(missingTSN))
+                        if (!_missingChunks.TryGetValue(missingTSN, out int missCount))
                         {
                             if (!_unconfirmedChunks.ContainsKey(missingTSN))
                             {
@@ -412,7 +430,26 @@ namespace SIPSorcery.Net
                             else
                             {
                                 logger.LogTrace($"SCTP SACK gap adding retransmit entry for TSN {missingTSN}.");
-                                _missingChunks.TryAdd(missingTSN, 0);
+                                _missingChunks.TryAdd(missingTSN, 1);
+                            }
+                        }
+                        else
+                        {
+                            _missingChunks.TryUpdate(missingTSN, missCount + 1, missCount);
+
+                            // rfc 7.2.4: When the third consecutive miss indication is received for a TSN(s), the data sender shall do the following...
+                            if (missCount == 3)
+                            {
+                                if (!_inFastRecoveryMode) // RFC4960 7.2.4 (2)
+                                {
+                                    _inFastRecoveryMode = true;
+                                    _fastRecoveryExitPoint = ? TODO 
+
+                                    logger.LogTrace($"SCTP sender entering fast recovery mode due to missing TSN {missingTSN}. Fast recovery exit point {_fastRecoveryExitPoint}.");
+                                    // RFC4960 7.2.3
+                                    _slowStartThreshold = (uint)Math.Max(_congestionWindow / 2, 4 * _defaultMTU);
+                                    _congestionWindow = _defaultMTU;
+                                }
                             }
                         }
 
@@ -452,10 +489,8 @@ namespace SIPSorcery.Net
                         logger.LogWarning($"SCTP data sender could not remove unconfirmed chunk for {_cumulativeAckTSN}.");
                     }
 
-                    if (_missingChunks.ContainsKey(_cumulativeAckTSN))
-                    {
-                        _missingChunks.TryRemove(_cumulativeAckTSN, out _);
-                    }
+                    _missingChunks.TryRemove(_cumulativeAckTSN, out _);
+
                 } while (_cumulativeAckTSN != sackTSN && safety >= 0);
             }
         }
@@ -469,11 +504,12 @@ namespace SIPSorcery.Net
 
             while (!_isClosed)
             {
+                var outstandingBytes = _outstandingBytes;
                 // DateTime.Now calls have been a tiny bit expensive in the past so get a small saving by only
                 // calling once per loop.
                 DateTime now = DateTime.Now;
 
-                int burstSize = (_inRetransmitMode || _congestionWindow < _outstandingBytes || _receiverWindow == 0) ? 1 : MAX_BURST;
+                int burstSize = (_inRetransmitMode || _inFastRecoveryMode || _congestionWindow < outstandingBytes || _receiverWindow == 0) ? 1 : MAX_BURST;
                 int chunksSent = 0;
 
                 //logger.LogTrace($"SCTP sender burst size {burstSize}, in retransmit mode {_inRetransmitMode}, cwnd {_congestionWindow}, arwnd {_receiverWindow}.");
@@ -486,7 +522,8 @@ namespace SIPSorcery.Net
 
                     while (chunksSent < burstSize && haveMissing)
                     {
-                        if (_unconfirmedChunks.TryGetValue(misses.Current.Key, out var missingChunk))
+                        if (_unconfirmedChunks.TryGetValue(misses.Current.Key, out var missingChunk) 
+                            && misses.Current.Value >= 3) // RFC4960 7.2.4
                         {
                             missingChunk.LastSentAt = now;
                             missingChunk.SendCount += 1;
@@ -496,6 +533,7 @@ namespace SIPSorcery.Net
 
                             _sendDataChunk(missingChunk);
                             chunksSent++;
+                            _missingChunks.TryUpdate(misses.Current.Key, 0, misses.Current.Value);
                         }
 
                         haveMissing = misses.MoveNext();
@@ -535,10 +573,11 @@ namespace SIPSorcery.Net
                             }
                         }
                     }
-                }
+                // rfc4960 6.1: At any given time, the sender MUST NOT transmit new data to a given transport address
+                // if it has cwnd or more bytes of data outstanding to that transport address.
 
-                // Finally send any new data chunks that have not yet been sent.
-                if (chunksSent < burstSize && _sendQueue.Count > 0)
+                // Send any new data chunks that have not yet been sent.
+                if (chunksSent < burstSize && _sendQueue.Count > 0 && _congestionWindow > outstandingBytes)
                 {
                     while (chunksSent < burstSize && _sendQueue.TryDequeue(out var dataChunk))
                     {
