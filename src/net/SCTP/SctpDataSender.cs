@@ -202,6 +202,12 @@ namespace SIPSorcery.Net
         {
             if (sack != null)
             {
+                if (_inRetransmitMode)
+                {
+                    logger.LogTrace($"SCTP sender exiting retransmit mode.");
+                    _inRetransmitMode = false;
+                }
+
                 unchecked
                 {
                     uint maxTSNDistance = SctpDataReceiver.GetDistance(_cumulativeAckTSN, TSN);
@@ -213,7 +219,6 @@ namespace SIPSorcery.Net
                         // Don't include retransmits in round trip calculation
                         if (result.SendCount == 1)
                         {
-                            _inRetransmitMode = false;
                             UpdateRoundTripTime(result);
                         }
 
@@ -460,7 +465,7 @@ namespace SIPSorcery.Net
                                 _missingChunks.TryUpdate(missingTSN, missCount + 1, missCount);
 
                                 // rfc 7.2.4: When the third consecutive miss indication is received for a TSN(s), the data sender shall do the following...
-                                if (missCount == 3)
+                                if (missCount + 1 == 3)
                                 {
                                     if (!_inFastRecoveryMode) // RFC4960 7.2.4 (2)
                                     {
@@ -535,15 +540,10 @@ namespace SIPSorcery.Net
                 //logger.LogTrace($"SCTP sender burst size {burstSize}, in retransmit mode {_inRetransmitMode}, cwnd {_congestionWindow}, arwnd {_receiverWindow}.");
 
                 // Missing chunks from a SACK gap report take priority.
-                if (_missingChunks.Count > 0 && chunksSent < burstSize)
+                if (_missingChunks.Count > 0)
                 {
                     foreach (var missing in _missingChunks)
                     {
-                        if (chunksSent >= burstSize)
-                        {
-                            break;
-                        }
-
                         if (missing.Value >= 3)  // RFC4960 7.2.4 Fast retransmission
                         {
                             if (_unconfirmedChunks.TryGetValue(missing.Key, out var missingChunk))
@@ -558,6 +558,10 @@ namespace SIPSorcery.Net
                                 chunksSent++;
                                 _missingChunks.TryUpdate(missing.Key, 0, missing.Value);
                             }
+                        }
+                        if (chunksSent >= burstSize)
+                        {
+                            break;
                         }
                     }
                 }
@@ -580,6 +584,7 @@ namespace SIPSorcery.Net
                         
                         if (!_inRetransmitMode)
                         {
+                            logger.LogTrace($"SCTP sender entering retransmit mode.");
                             _inRetransmitMode = true;
 
                             // When the T3-rtx timer expires on an address, SCTP should perform slow start.
